@@ -2,17 +2,20 @@
 DEBUG SCRIPT: Output factors + adjusted_float_vector for each tranche
 =====================================================================
 Outputs X_Actual, X_Fixed, X_Increased, X_Decreased, Experience_Factor,
-Interpolation_Vector, Adjustment_Factor, and full Adjusted_Float_Vector
-for a chosen scenario and offset.
+Interpolation_Vector, Adjustment_Factor, Actual Claims CF (blended_claims),
+and full Adjusted_Float_Vector for a chosen scenario and offset.
 
 Usage:
     python debug_afv_scenario1_offset1.py
+    python debug_afv_scenario1_offset1.py --scenario 3 --offset 5
 
-Edit SCENARIO_NUMBER and TARGET_OFFSET in the CONFIG section below.
+Edit SCENARIO_NUMBER and TARGET_OFFSET in the CONFIG section below,
+or override them via command-line arguments.
 """
 
 import sys
 import os
+import argparse
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -228,9 +231,28 @@ def main():
     setup_logging(log_dir="data/output/logs")
 
     # ------------------------------------------------------------------
-    # Resolve scenario config from SCENARIO_NUMBER
+    # Parse CLI arguments (fall back to CONFIG constants)
     # ------------------------------------------------------------------
-    scenario = SCENARIOS[SCENARIO_NUMBER - 1]  # 1-indexed
+    parser = argparse.ArgumentParser(
+        description="Debug: output factors + AFV + actual claims CF per tranche"
+    )
+    parser.add_argument(
+        "--scenario", type=int, default=SCENARIO_NUMBER,
+        help=f"Scenario number 1-{len(SCENARIOS)} (default: {SCENARIO_NUMBER})"
+    )
+    parser.add_argument(
+        "--offset", type=int, default=TARGET_OFFSET,
+        help=f"Offset in months from valuation date (default: {TARGET_OFFSET})"
+    )
+    args = parser.parse_args()
+
+    scenario_number = args.scenario
+    target_offset = args.offset
+
+    # ------------------------------------------------------------------
+    # Resolve scenario config
+    # ------------------------------------------------------------------
+    scenario = SCENARIOS[scenario_number - 1]  # 1-indexed
     scenario_name = scenario["name"]
     grading_period = scenario["grading_period"]
     discount_shock = scenario["discount_rate_shock"]
@@ -240,13 +262,16 @@ def main():
     if grading_period == 0:
         blend_factor = 0.0
     else:
-        blend_factor = min(1.0, TARGET_OFFSET / grading_period)
+        blend_factor = min(1.0, target_offset / grading_period)
+
+    # Dynamic output CSV path
+    output_csv = f"data/output/debug_afv_scenario{scenario_number}_offset{target_offset}.csv"
 
     print("=" * 80)
-    print(f"DEBUG: factors + adjusted_float_vector")
-    print(f"  Scenario {SCENARIO_NUMBER}: {scenario_name}  "
+    print(f"DEBUG: factors + adjusted_float_vector + actual claims CF")
+    print(f"  Scenario {scenario_number}: {scenario_name}  "
           f"(claims={claims_type}, gp={grading_period}, shock={discount_shock})")
-    print(f"  Offset   : {TARGET_OFFSET}")
+    print(f"  Offset   : {target_offset}")
     print(f"  Blend    : {blend_factor:.10f}")
     print("=" * 80)
     print()
@@ -333,12 +358,12 @@ def main():
     # ------------------------------------------------------------------
     # 4. Run chosen scenario/offset for each tranche
     # ------------------------------------------------------------------
-    print(f"[7/7] Computing factors + AFV for each tranche "
-          f"(Scenario {SCENARIO_NUMBER}, offset={TARGET_OFFSET})...")
+    print(f"[7/7] Computing factors + AFV + claims CF for each tranche "
+          f"(Scenario {scenario_number}, offset={target_offset})...")
     print()
 
-    offset_date_str = get_offset_date(VALUATION_DATE, TARGET_OFFSET)
-    anchor_date_ts = (val_month_end.to_period("M") + TARGET_OFFSET).to_timestamp("M")
+    offset_date_str = get_offset_date(VALUATION_DATE, target_offset)
+    anchor_date_ts = (val_month_end.to_period("M") + target_offset).to_timestamp("M")
 
     all_rows = []  # for CSV export
 
@@ -445,13 +470,20 @@ def main():
                   f"sum_fixed={factors['sum_fixed_adj']:.6f}, "
                   f"sum_inc={factors['sum_increased_adj']:.6f}, "
                   f"sum_dec={factors['sum_decreased_adj']:.6f})")
+            # Slice blended_claims from anchor forward (same range as AFV)
+            claims_cf = blended_claims[anchor_idx : anchor_idx + len(afv)]
+
             print()
-            print(f"  ADJUSTED_FLOAT_VECTOR  (length={len(afv)}, sum={np.nansum(afv):.6f}):")
+            print(f"  ACTUAL CLAIMS CF & AFV  (length={len(afv)}, "
+                  f"claims_sum={np.nansum(claims_cf):.6f}, afv_sum={np.nansum(afv):.6f}):")
+            print(f"    {'Idx':>5s}  {'Date':<12s}  {'Claims_CF':>16s}  {'AFV':>16s}")
+            print(f"    {'-----':>5s}  {'------------':<12s}  {'----------------':>16s}  {'----------------':>16s}")
 
             n_print = min(PRINT_HEAD, len(afv))
             for j in range(n_print):
                 date_label = afv_dates[j] if j < len(afv_dates) else "?"
-                print(f"    [{j:4d}] {date_label}  ->  {afv[j]:.10f}")
+                cf_val = claims_cf[j] if j < len(claims_cf) else float('nan')
+                print(f"    [{j:4d}] {date_label:<12s}  {cf_val:>16.10f}  {afv[j]:>16.10f}")
             if len(afv) > PRINT_HEAD:
                 print(f"    ... ({len(afv) - PRINT_HEAD} more values)")
             print()
@@ -459,15 +491,17 @@ def main():
             # Collect rows for CSV
             for j in range(len(afv)):
                 date_label = afv_dates[j] if j < len(afv_dates) else ""
+                cf_val = claims_cf[j] if j < len(claims_cf) else float('nan')
                 all_rows.append({
                     "Deal": deal_name,
                     "Tranche": tranche_name,
                     "Scenario": scenario_name,
-                    "Offset": TARGET_OFFSET,
+                    "Offset": target_offset,
                     "Blend_Factor": blend_factor,
                     "Anchor_Date": str(anchor_date_ts.date()),
                     "AFV_Index": j,
                     "Date": date_label,
+                    "Blended_Claims_CF": cf_val,
                     "Adjusted_Float_Vector": afv[j],
                     "X_Actual": factors["X_Actual"],
                     "X_Fixed": factors["X_Fixed"],
@@ -485,12 +519,12 @@ def main():
     # ------------------------------------------------------------------
     # 5. Export to CSV
     # ------------------------------------------------------------------
-    if OUTPUT_CSV and all_rows:
-        os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+    if output_csv and all_rows:
+        os.makedirs(os.path.dirname(output_csv), exist_ok=True)
         df_out = pd.DataFrame(all_rows)
-        df_out.to_csv(OUTPUT_CSV, index=False)
+        df_out.to_csv(output_csv, index=False)
         print("=" * 70)
-        print(f"Exported {len(df_out)} rows to {OUTPUT_CSV}")
+        print(f"Exported {len(df_out)} rows to {output_csv}")
 
     print()
     print("Done.")
